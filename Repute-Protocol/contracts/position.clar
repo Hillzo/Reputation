@@ -1,9 +1,7 @@
-;; ==============================================
 ;; Enhanced Reputation Protocol Smart Contract
 ;; A comprehensive system for managing participant reputation with staking and governance
-;; ==============================================
 
-;; ==================== Error Definitions ====================
+;; Error Definitions
 ;; Governance and access control errors (1xx range)
 (define-constant ERR-ACCESS-DENIED (err u100))
 (define-constant ERR-GOVERNANCE-DISABLED (err u101))
@@ -23,7 +21,7 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u400))
 (define-constant ERR-ECONOMIC-CONSTRAINT (err u401))
 
-;; ==================== Protocol Constants ====================
+;; Protocol Constants
 ;; Reputation bounds
 (define-constant REPUTATION-MINIMUM u0)
 (define-constant REPUTATION-MAXIMUM u100)
@@ -42,7 +40,7 @@
 (define-constant PROPOSAL-THRESHOLD u75)
 (define-constant VOTING-PERIOD u1008)  ;; ~1 week in blocks
 
-;; ==================== Protocol State Variables ====================
+;; Protocol State Variables
 ;; Administrative state
 (define-data-var protocol-administrator principal tx-sender)
 (define-data-var governance-enabled bool true)
@@ -56,8 +54,8 @@
     {
         min-reputation: REPUTATION-MINIMUM,
         max-reputation: REPUTATION-MAXIMUM,
-        collateral-requirement: MINIMUM_COLLATERAL_REQUIREMENT,
-        epoch-length: EPOCH_LENGTH
+        collateral-requirement: MINIMUM-COLLATERAL-REQUIREMENT,
+        epoch-length: EPOCH-LENGTH
     }
 )
 
@@ -77,7 +75,7 @@
     }
 )
 
-;; ==================== Data Maps ====================
+;; Data Maps
 ;; Participant core data
 (define-map participant-registry
     principal
@@ -128,7 +126,7 @@
     }
 )
 
-;; ==================== Private Functions ====================
+;; Private Functions
 ;; Validation functions
 (define-private (validate-reputation-bounds (score uint))
     (let
@@ -139,6 +137,54 @@
             (>= score (get min-reputation params))
             (<= score (get max-reputation params))
         )
+    )
+)
+
+(define-private (validate-protocol-parameters 
+    (params {
+        min-reputation: uint,
+        max-reputation: uint,
+        collateral-requirement: uint,
+        epoch-length: uint
+    }))
+    (if (and 
+        ;; Ensure min reputation is less than max
+        (< (get min-reputation params) (get max-reputation params))
+        ;; Ensure collateral requirement is reasonable
+        (>= (get collateral-requirement params) MINIMUM-COLLATERAL-REQUIREMENT)
+        ;; Ensure epoch length is within bounds
+        (and (>= (get epoch-length params) u1) (<= (get epoch-length params) u10000))
+    )
+    (ok params)  ;; Return validated params instead of just true
+    ERR-VALIDATION-FAILED)
+)
+
+(define-private (validate-participant-data (participant-data {
+        reputation-score: uint,
+        last-active-epoch: uint,
+        evaluation-count: uint,
+        collateral-balance: uint,
+        status: (string-ascii 20)
+    }))
+    (if (and
+        (validate-reputation-bounds (get reputation-score participant-data))
+        (>= (get collateral-balance participant-data) MINIMUM-COLLATERAL-REQUIREMENT)
+        (or 
+            (is-eq (get status participant-data) "ACTIVE")
+            (is-eq (get status participant-data) "SUSPENDED")
+            (is-eq (get status participant-data) "PROBATION")
+        )
+    )
+    (ok participant-data)  ;; Return validated data instead of just true
+    ERR-VALIDATION-FAILED)
+)
+
+(define-private (validate-metadata (metadata (optional (string-utf8 100))))
+    (match metadata
+        meta (if (< (len meta) u100)
+            (ok metadata)  ;; Return validated metadata
+            ERR-VALIDATION-FAILED)
+        (ok none)  ;; None is always valid
     )
 )
 
@@ -170,7 +216,7 @@
     )
 )
 
-;; ==================== Public Functions ====================
+;; Public Functions
 ;; Protocol administration
 (define-public (update-protocol-parameters 
     (new-params {
@@ -181,8 +227,11 @@
     }))
     (begin
         (asserts! (is-protocol-administrator) ERR-ACCESS-DENIED)
-        (var-set protocol-parameters new-params)
-        (ok true)
+        (let
+            ((validated-params (try! (validate-protocol-parameters new-params))))
+            (var-set protocol-parameters validated-params)
+            (ok true)
+        )
     )
 )
 
@@ -197,14 +246,18 @@
         
         (try! (stx-transfer? initial-collateral tx-sender (as-contract tx-sender)))
         
-        (map-set participant-registry tx-sender
-            {
-                reputation-score: REPUTATION-MAXIMUM,
-                last-active-epoch: (get current-epoch (var-get global-statistics)),
-                evaluation-count: u0,
-                collateral-balance: initial-collateral,
-                status: "ACTIVE"
-            }
+        (let
+            (
+                (new-participant-data {
+                    reputation-score: REPUTATION-MAXIMUM,
+                    last-active-epoch: (get current-epoch (var-get global-statistics)),
+                    evaluation-count: u0,
+                    collateral-balance: initial-collateral,
+                    status: "ACTIVE"
+                })
+                (validated-data (try! (validate-participant-data new-participant-data)))
+            )
+            (map-set participant-registry tx-sender validated-data)
         )
         
         (var-set global-statistics
@@ -229,7 +282,9 @@
             (evaluator-data (unwrap! (map-get? evaluator-credentials tx-sender) ERR-ACCESS-DENIED))
             (participant-data (unwrap! (map-get? participant-registry participant) ERR-ENTITY-NOT-FOUND))
             (current-epoch (get current-epoch (var-get global-statistics)))
+            (validated-metadata (try! (validate-metadata metadata)))
         )
+        ;; Add validation checks
         (asserts! (get authorization-status evaluator-data) ERR-ACCESS-DENIED)
         (asserts! (validate-reputation-bounds reputation-score) ERR-BOUNDS-VIOLATION)
         
@@ -241,8 +296,18 @@
                     (get evaluation-count participant-data)
                     (get accuracy-score evaluator-data)
                 ))
+                (new-participant-data (merge participant-data
+                    {
+                        reputation-score: weighted-score,
+                        last-active-epoch: current-epoch,
+                        evaluation-count: (+ (get evaluation-count participant-data) u1)
+                    }
+                ))
+                (validated-participant-data (try! (validate-participant-data new-participant-data)))
             )
-            ;; Update evaluation ledger
+            (asserts! (validate-reputation-bounds weighted-score) ERR-BOUNDS-VIOLATION)
+            
+            ;; Update evaluation ledger with validated data
             (map-set evaluation-ledger 
                 { participant: participant, epoch: current-epoch }
                 {
@@ -250,20 +315,12 @@
                     weighted-score: weighted-score,
                     evaluator: tx-sender,
                     timestamp: block-height,
-                    metadata: metadata
+                    metadata: validated-metadata
                 }
             )
             
-            ;; Update participant registry
-            (map-set participant-registry participant
-                (merge participant-data
-                    {
-                        reputation-score: weighted-score,
-                        last-active-epoch: current-epoch,
-                        evaluation-count: (+ (get evaluation-count participant-data) u1)
-                    }
-                )
-            )
+            ;; Update participant registry with validated data
+            (map-set participant-registry participant validated-participant-data)
             
             ;; Update global statistics
             (var-set global-statistics
@@ -279,7 +336,7 @@
     )
 )
 
-;; ==================== Read-Only Functions ====================
+;; Read-Only Functions
 (define-read-only (get-participant-profile (participant principal))
     (let
         (
